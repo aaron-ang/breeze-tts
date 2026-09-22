@@ -17,3 +17,8 @@ htmlcov/
 .env.*
 !.env.example
 
+
+.venv/
+*.log
+*.egg-info/
+dist/
