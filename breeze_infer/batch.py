@@ -11,6 +11,34 @@ import torch
 from models.cudagraph.depth_decoder_graph import DepthDecoderGraph
 
 
+@contextmanager
+def eager_batch_modules(model: Any) -> Iterator[None]:
+    """Use batch-compatible modules without duplicating or changing weights.
+
+    Fast streaming compiles these modules for its own shapes. Batch capture and
+    eager generation must not recompile those wrappers for every batch size.
+    Streaming text-encoder graphs cover fixed shapes, so batches use eager text
+    encoding. The caller holds the lock; restore streaming state before returning.
+    """
+    depth = model.depth_decoder.model
+    layers = list(depth.layers)
+    norm = depth.norm
+    fast_text_encoder = getattr(model, "_fast_text_encoder_cudagraph", False)
+    try:
+        if fast_text_encoder:
+            model._fast_text_encoder_cudagraph = False
+        for index, layer in enumerate(layers):
+            depth.layers[index] = getattr(layer, "_orig_mod", layer)
+        depth.norm = getattr(norm, "_orig_mod", norm)
+        yield
+    finally:
+        for index, layer in enumerate(layers):
+            depth.layers[index] = layer
+        depth.norm = norm
+        if fast_text_encoder:
+            model._fast_text_encoder_cudagraph = fast_text_encoder
+
+
 class BatchDepthDecoder:
     """Replace eager per-codebook depth decoding with captured graphs.
 

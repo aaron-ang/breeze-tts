@@ -106,6 +106,9 @@ def test_streaming_reseeds_immediately_before_model_sampling(monkeypatch) -> Non
 
 class FakeBatchModel:
     def __init__(self, lengths: list[int] | None = None) -> None:
+        self.depth_decoder = SimpleNamespace(
+            model=SimpleNamespace(layers=[], norm=torch.nn.Identity())
+        )
         self.lengths = lengths
         self.calls = []
         self.head = torch.nn.Linear(2, 2)

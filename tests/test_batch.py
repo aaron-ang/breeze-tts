@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from breeze_infer.batch import BatchDepthDecoder
+from breeze_infer.batch import BatchDepthDecoder, eager_batch_modules
 
 
 class FakeGraph:
@@ -105,3 +105,33 @@ def test_bucket_sizes_cover_paired_rows_for_max_batch(monkeypatch) -> None:
     assert captured["dtype"] == torch.bfloat16
     assert captured["top_p"] == 1.0
     assert captured["top_k"] == 50
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_batch_borrows_original_modules_and_restores_streaming_wrappers(fail):
+    class Compiled(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._orig_mod = torch.nn.Linear(2, 2)
+
+        def forward(self, *args):
+            raise AssertionError("batch must not invoke streaming compile wrapper")
+
+    layer, norm = Compiled(), Compiled()
+    depth = SimpleNamespace(layers=torch.nn.ModuleList([layer]), norm=norm)
+    model = SimpleNamespace(
+        depth_decoder=SimpleNamespace(model=depth), _fast_text_encoder_cudagraph=True
+    )
+    try:
+        with eager_batch_modules(model):
+            assert model._fast_text_encoder_cudagraph is False
+            assert depth.layers[0] is layer._orig_mod
+            assert depth.norm is norm._orig_mod
+            depth.norm(depth.layers[0](torch.ones(1, 2)))
+            if fail:
+                raise ValueError("generation failed")
+    except ValueError:
+        assert fail
+    assert depth.layers[0] is layer
+    assert depth.norm is norm
+    assert model._fast_text_encoder_cudagraph is True

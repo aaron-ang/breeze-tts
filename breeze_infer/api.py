@@ -25,7 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.types import Receive, Scope, Send
 from transformers.generation.logits_process import LogitsProcessorList
 
-from breeze_infer.batch import BatchDepthDecoder
+from breeze_infer.batch import BatchDepthDecoder, eager_batch_modules
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
@@ -514,22 +514,23 @@ def _generate_batch_pcm(
         [GeneratedTokenRepetitionPenaltyLogitsProcessor(REPETITION_PENALTY)]
     )
 
-    if cfg_scale != 1.0:
-        app.state.batch_depth_decoder.prepare(len(texts))
-    # Graph warmup consumes RNG; reseed after lazy capture as well as preparation.
-    set_all_seeds(seed)
-    with (
-        torch.inference_mode(),
-        _swapped_weights(app.state.batch_head_weights),
-        app.state.batch_depth_decoder.bound(app.state.model),
-    ):
-        audio = app.state.model.generate(
-            **inputs,
-            output_audio=True,
-            audio_tokenizer=app.state.audio_tokenizer,
-            logits_processor=logits_processor,
-            max_new_tokens=max_new_tokens,
-        )
+    with eager_batch_modules(app.state.model):
+        if cfg_scale != 1.0:
+            app.state.batch_depth_decoder.prepare(len(texts))
+        # Graph warmup consumes RNG; reseed after lazy capture as well as preparation.
+        set_all_seeds(seed)
+        with (
+            torch.inference_mode(),
+            _swapped_weights(app.state.batch_head_weights),
+            app.state.batch_depth_decoder.bound(app.state.model),
+        ):
+            audio = app.state.model.generate(
+                **inputs,
+                output_audio=True,
+                audio_tokenizer=app.state.audio_tokenizer,
+                logits_processor=logits_processor,
+                max_new_tokens=max_new_tokens,
+            )
 
     if len(audio) != len(texts):
         raise RuntimeError(
