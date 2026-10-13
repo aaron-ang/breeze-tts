@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -10,16 +11,18 @@ import os
 import tempfile
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import anyio
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
 from transformers.generation.logits_process import LogitsProcessorList
 
 from breeze_infer.batch import BatchDepthDecoder
@@ -114,16 +117,29 @@ def read_frame_rate(model_dir: Path) -> float:
 
 
 def compute_model_digest(model_dir: Path) -> str:
-    """Hash the checkpoint's config and safetensors index, never the weights.
-
-    The digest depends only on file contents, so the same checkpoint yields the
-    same value from a local directory or any Hugging Face cache location.
-    """
-    digest = hashlib.sha256()
-    digest.update((model_dir / MODEL_CONFIG_FILE).read_bytes())
+    """Hash checkpoint metadata and weight contents once, without loading tensors."""
+    names = {MODEL_CONFIG_FILE}
     index_path = model_dir / MODEL_INDEX_FILE
     if index_path.is_file():
-        digest.update(index_path.read_bytes())
+        names.add(MODEL_INDEX_FILE)
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        names.update(index["weight_map"].values())
+    else:
+        names.add("model.safetensors")
+
+    digest = hashlib.sha256(b"breeze-checkpoint-v1\0")
+    for name in sorted(names):
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Invalid checkpoint file path: {name}")
+        path = model_dir / relative
+        encoded_name = relative.as_posix().encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(path.stat().st_size.to_bytes(8, "big"))
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -134,6 +150,36 @@ def build_model_info(model_dir: Path) -> dict[str, float | str | int]:
         "max_new_tokens": MAX_NEW_TOKENS,
         "max_batch_texts": MAX_BATCH_TEXTS,
     }
+
+
+class _InferenceStreamingResponse(StreamingResponse):
+    """Own the inference lifetime, including disconnects before the first chunk."""
+
+    def __init__(
+        self,
+        stream: Generator[bytes, None, None],
+        cleanup: Callable[[], None],
+        **kwargs,
+    ) -> None:
+        super().__init__(stream, **kwargs)
+        self._stream = stream
+        self._cleanup = cleanup
+
+    def _close(self) -> None:
+        try:
+            self._stream.close()
+        finally:
+            self._cleanup()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette's threadpool iteration waits for an in-flight next() to
+            # finish before cancellation unwinds here. Close only then, and keep
+            # cleanup shielded so the model is idle before another request enters.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self._close)
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -190,18 +236,20 @@ def _iter_seeded_audio_chunks(
 
 async def _save_upload(upload: UploadFile) -> Path:
     suffix = Path(upload.filename or "reference.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(
-        prefix="breeze_ref_", suffix=suffix, delete=False
-    ) as temporary:
-        path = Path(temporary.name)
-        try:
+    path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="breeze_ref_", suffix=suffix, delete=False
+        ) as temporary:
+            path = Path(temporary.name)
             payload = await upload.read()
             if not payload:
                 raise HTTPException(status_code=400, detail="Reference audio is empty.")
             temporary.write(payload)
-        except Exception:
+    except BaseException:
+        if path is not None:
             path.unlink(missing_ok=True)
-            raise
+        raise
     return path
 
 
@@ -209,12 +257,12 @@ def _checkpoint_head_weights(model) -> dict[torch.nn.Module, torch.nn.Parameter]
     """Snapshot the projection heads before streaming graph setup casts them.
 
     Streaming graph setup casts ``lm_head`` and the depth decoder's codebook head
-    to float32 in place. Eager batch generation runs the heads on bfloat16 hidden
-    states, so it swaps these checkpoint-dtype copies in for each call.
+    to float32 in place. Keep checkpoint-dtype copies on CPU so single-request
+    inference pays no extra GPU memory; transfer them only during a batch call.
     """
     heads = (model.lm_head, model.depth_decoder.codebooks_head)
     return {
-        head: torch.nn.Parameter(head.weight.detach().clone(), requires_grad=False)
+        head: torch.nn.Parameter(head.weight.detach().to(device="cpu", copy=True), requires_grad=False)
         for head in heads
     }
 
@@ -224,9 +272,12 @@ def _swapped_weights(
     weights: dict[torch.nn.Module, torch.nn.Parameter],
 ) -> Iterator[None]:
     originals = {module: module.weight for module in weights}
-    for module, weight in weights.items():
-        module.weight = weight
     try:
+        for module, weight in weights.items():
+            module.weight = (
+                weight if weight.device == module.weight.device else
+                torch.nn.Parameter(weight.to(module.weight.device), requires_grad=False)
+            )
         yield
     finally:
         for module, weight in originals.items():
@@ -311,6 +362,14 @@ async def speech(
         )
 
     reference_path: Path | None = None
+
+    def cleanup() -> None:
+        try:
+            if reference_path is not None:
+                reference_path.unlink(missing_ok=True)
+        finally:
+            _request_lock.release()
+
     try:
         if not np.isfinite(cfg_scale) or cfg_scale <= 0:
             raise HTTPException(
@@ -352,30 +411,29 @@ async def speech(
             guidance_scale_ref=None,
             guidance_scale_ins=None,
         )
-    except Exception:
-        if reference_path is not None:
-            reference_path.unlink(missing_ok=True)
-        _request_lock.release()
+    except BaseException:
+        cleanup()
         raise
 
-    def body() -> Iterator[bytes]:
-        try:
-            for chunk in _iter_seeded_audio_chunks(
+    def body() -> Generator[bytes, None, None]:
+        # Explicitly propagate close() through the sampling iterator to release
+        # the runtime's per-request codec state, without relying on GC.
+        with closing(
+            _iter_seeded_audio_chunks(
                 app.state.runtime,
                 inputs,
                 request_id=request_id,
                 seed=seed,
-            ):
+            )
+        ) as chunks:
+            for chunk in chunks:
                 pcm = _pcm16(chunk.audio)
                 if pcm:
                     yield pcm
-        finally:
-            if reference_path is not None:
-                reference_path.unlink(missing_ok=True)
-            _request_lock.release()
 
-    return StreamingResponse(
+    return _InferenceStreamingResponse(
         body(),
+        cleanup,
         media_type="audio/pcm",
         headers={
             "X-Sample-Rate": str(app.state.runtime.sample_rate),
@@ -501,6 +559,15 @@ async def speech_batch(
         )
 
     reference_path: Path | None = None
+    worker_owns_cleanup = False
+
+    def cleanup() -> None:
+        try:
+            if reference_path is not None:
+                reference_path.unlink(missing_ok=True)
+        finally:
+            _request_lock.release()
+
     try:
         parsed_texts = _parse_batch_texts(texts)
         if not np.isfinite(cfg_scale) or cfg_scale <= 0:
@@ -519,20 +586,36 @@ async def speech_batch(
             assert ref_audio is not None
             reference_path = await _save_upload(ref_audio)
 
-        segments = await run_in_threadpool(
-            _generate_batch_pcm,
-            parsed_texts,
-            instruction=instruction.strip() if instruction else None,
-            cfg_scale=cfg_scale,
-            seed=seed,
-            reference_path=reference_path,
-            ref_text=ref_text,
-            max_new_tokens=max_new_tokens,
-        )
+        def generate_and_cleanup() -> list[bytes]:
+            try:
+                return _generate_batch_pcm(
+                    parsed_texts,
+                    instruction=instruction.strip() if instruction else None,
+                    cfg_scale=cfg_scale,
+                    seed=seed,
+                    reference_path=reference_path,
+                    ref_text=ref_text,
+                    max_new_tokens=max_new_tokens,
+                )
+            finally:
+                cleanup()
+
+        # Submit before transferring ownership, without an intervening await.
+        # Shield the future so cancellation cannot discard a queued worker and
+        # strand its resources. Once submitted, only the worker may clean up.
+        future = asyncio.get_running_loop().run_in_executor(None, generate_and_cleanup)
+        worker_owns_cleanup = True
+        try:
+            segments = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # A cancelled caller cannot retrieve a later worker exception.
+            future.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+            raise
     finally:
-        if reference_path is not None:
-            reference_path.unlink(missing_ok=True)
-        _request_lock.release()
+        if not worker_owns_cleanup:
+            cleanup()
 
     return Response(
         content=b"".join(segments),
