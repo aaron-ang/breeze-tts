@@ -178,13 +178,18 @@ For offline synthesis, send many texts in one request. Decoding one sequence at 
 curl -X POST http://127.0.0.1:7860/v1/audio/speech/batch \
   -F 'texts=["The first sentence.", "The second sentence."]' \
   -F "instruction=A calm, clear narrator." \
+  -F "cfg_scale=4" \
   -F "seed=42" \
   -F "max_new_tokens=600" \
   --dump-header headers.txt \
   --output batch.pcm
 ```
 
-`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500. Batch inference is opt-in: its GPU memory grows with batch size and sequence length, so start with a small batch and increase it to fit your GPU. The 7.7 GiB / 12 GB recommendation above describes single-request eager inference, not a 128-text batch. Batch support keeps its backup weights on CPU and does not add GPU allocations to single-request inference. Batches use eager generation and share the single inference slot with streaming requests; a request made while another is running returns `409`.
+`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500.
+
+Batch inference is opt-in: its GPU memory grows with batch size and sequence length, so start with a small batch and increase it to fit your GPU. The 7.7 GiB / 12 GB recommendation above describes single-request eager inference, not a 128-text batch. Batch support keeps its backup weights on CPU and does not add GPU allocations to single-request inference.
+
+Batches use eager generation and share the single inference slot with streaming requests; a request made while another is running returns `409`.
 
 The response body is the mono 24 kHz s16le PCM of every segment concatenated in request order. `X-Segment-Bytes` lists each segment's byte length, comma separated, so the body can be split back into segments.
 
