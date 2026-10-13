@@ -184,7 +184,7 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech/batch \
   --output batch.pcm
 ```
 
-`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500. Batches use eager generation and share the single inference slot with streaming requests; a request made while another is running returns `409`.
+`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500. Batch inference is opt-in: its GPU memory grows with batch size and sequence length, so start with a small batch and increase it to fit your GPU. The 7.7 GiB / 12 GB recommendation above describes single-request eager inference, not a 128-text batch. Batch support keeps its backup weights on CPU and does not add GPU allocations to single-request inference. Batches use eager generation and share the single inference slot with streaming requests; a request made while another is running returns `409`.
 
 The response body is the mono 24 kHz s16le PCM of every segment concatenated in request order. `X-Segment-Bytes` lists each segment's byte length, comma separated, so the body can be split back into segments.
 
@@ -194,7 +194,7 @@ The response body is the mono 24 kHz s16le PCM of every segment concatenated in 
 {"frame_rate": 12.5, "model_digest": "<sha256>", "max_new_tokens": 1500, "max_batch_texts": 128}
 ```
 
-`frame_rate` is the codec frame rate (tokens per second of audio), useful for sizing `max_new_tokens`. `model_digest` is a SHA-256 over the checkpoint's `config.json` and `model.safetensors.index.json`, so it identifies the checkpoint regardless of where it is stored.
+`frame_rate` is the codec frame rate (tokens per second of audio), useful for sizing `max_new_tokens`. `model_digest` is a SHA-256 over the checkpoint config, safetensors index (if present), and all referenced model weight files. It is computed once at startup using bounded-memory reads, distinguishes changed weights, and is independent of the checkpoint directory.
 
 ### ⚡ Fast Inference Options
 

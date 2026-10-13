@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import logging
@@ -292,6 +291,7 @@ def test_checkpoint_head_weights_survive_in_place_head_casts() -> None:
 
     assert set(weights) == {model.lm_head, model.depth_decoder.codebooks_head}
     assert all(weight.dtype == torch.bfloat16 for weight in weights.values())
+    assert all(weight.device.type == "cpu" for weight in weights.values())
     assert torch.equal(weights[model.lm_head], expected)
     with api._swapped_weights(weights):
         assert model.lm_head.weight.dtype == torch.bfloat16
@@ -408,7 +408,8 @@ def _write_checkpoint(model_dir, *, index: bool = True, config=None):
     (model_dir / "config.json").write_bytes(config_bytes)
     if index:
         (model_dir / "model.safetensors.index.json").write_bytes(index_bytes)
-    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    weight_name = "model-00001-of-00001.safetensors" if index else "model.safetensors"
+    (model_dir / weight_name).write_bytes(b"weights")
     return config_bytes, index_bytes if index else b""
 
 
@@ -426,20 +427,26 @@ def test_read_frame_rate_requires_codec_frame_rate(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("index", [True, False])
-def test_model_digest_hashes_config_then_index(tmp_path, index) -> None:
-    config_bytes, index_bytes = _write_checkpoint(tmp_path, index=index)
+def test_model_digest_tracks_weights_and_config_but_not_location(tmp_path, index) -> None:
+    first, second = tmp_path / "a", tmp_path / "b"
+    _write_checkpoint(first, index=index)
+    _write_checkpoint(second, index=index)
+    original = api.compute_model_digest(first)
+    assert original == api.compute_model_digest(second)
+    weight_name = "model-00001-of-00001.safetensors" if index else "model.safetensors"
+    (second / weight_name).write_bytes(b"changed")
+    changed = api.compute_model_digest(second)
+    assert changed != original
+    (second / "config.json").write_text('{"codec_config": {"_frame_rate": 25}}')
+    assert api.compute_model_digest(second) != changed
 
-    expected = hashlib.sha256(config_bytes + index_bytes).hexdigest()
-    assert api.compute_model_digest(tmp_path) == expected
 
-
-def test_model_digest_ignores_location_and_weights(tmp_path) -> None:
-    _write_checkpoint(tmp_path / "a")
-    _write_checkpoint(tmp_path / "b")
-    (tmp_path / "b" / "model-00001-of-00001.safetensors").write_bytes(b"other")
-
-    digest = api.compute_model_digest(tmp_path / "a")
-    assert digest == api.compute_model_digest(tmp_path / "b")
+def test_model_digest_requires_all_indexed_shards(tmp_path) -> None:
+    _write_checkpoint(tmp_path)
+    index = {"weight_map": {"a": "model-00001-of-00001.safetensors", "b": "missing.safetensors"}}
+    (tmp_path / api.MODEL_INDEX_FILE).write_text(json.dumps(index))
+    with pytest.raises(FileNotFoundError):
+        api.compute_model_digest(tmp_path)
 
 
 def test_model_route_reports_checkpoint_facts(tmp_path, monkeypatch) -> None:
