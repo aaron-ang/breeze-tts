@@ -16,17 +16,27 @@ class BatchDepthDecoder:
 
     The model's eager CFG depth loop reruns the whole codebook prefix twice per
     codebook. The streaming ``DepthDecoderGraph`` decodes with a static KV cache
-    and pads each call to the smallest captured bucket, so one instance serves
-    every batch size up to ``max_batch_size`` texts.
+    and pads each call to a power-of-two bucket. Capture only the active bucket
+    on demand, so startup and single-request inference allocate no batch graphs.
     """
 
     def __init__(self, model: Any, *, max_batch_size: int) -> None:
-        bucket_sizes = []
-        bucket = 2
-        while bucket < 2 * max_batch_size:
-            bucket_sizes.append(bucket)
-            bucket *= 2
-        bucket_sizes.append(bucket)
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.graph = None
+        self.bucket_size = None
+
+    def prepare(self, batch_size: int) -> None:
+        """Keep only the current bucket; never preallocate all batch sizes."""
+        if not 1 <= batch_size <= self.max_batch_size:
+            raise ValueError(f"Unsupported batch size: {batch_size}")
+        bucket = 2 * (1 << (batch_size - 1).bit_length())
+        if self.graph is not None and self.bucket_size == bucket:
+            return
+        # Drop the previous graph before allocating its replacement.
+        self.graph = None
+        self.bucket_size = None
+        model = self.model
         depth_decoder = model.depth_decoder
         generation_config = depth_decoder.generation_config
         top_p = generation_config.top_p
@@ -41,9 +51,10 @@ class BatchDepthDecoder:
             temperature=float(generation_config.temperature),
             num_codebooks=model.config.num_codebooks,
             codec_codebook_size=int(model.config.codec_config.codebook_size),
-            batch_size=bucket_sizes[0],
-            bucket_sizes=bucket_sizes,
+            batch_size=bucket,
+            bucket_sizes=[bucket],
         ).capture()
+        self.bucket_size = bucket
 
     def generate_with_cfg(
         self,
@@ -56,6 +67,8 @@ class BatchDepthDecoder:
             [cond_backbone_hidden_state, uncond_backbone_hidden_state], dim=0
         )
         first_codebook = depth_decoder_input_ids[:, 1].repeat(2)
+        if self.graph is None:
+            raise RuntimeError("Batch depth graph must be prepared before generation")
         codebooks = self.graph.run(
             backbone_hidden, first_codebook, guidance_scale=cfg_scale
         )

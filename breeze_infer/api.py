@@ -514,6 +514,9 @@ def _generate_batch_pcm(
         [GeneratedTokenRepetitionPenaltyLogitsProcessor(REPETITION_PENALTY)]
     )
 
+    if cfg_scale != 1.0:
+        app.state.batch_depth_decoder.prepare(len(texts))
+    # Graph warmup consumes RNG; reseed after lazy capture as well as preparation.
     set_all_seeds(seed)
     with (
         torch.inference_mode(),

@@ -87,10 +87,21 @@ def test_bucket_sizes_cover_paired_rows_for_max_batch(monkeypatch) -> None:
         ),
     )
 
-    BatchDepthDecoder(model, max_batch_size=128)
-
-    assert captured["bucket_sizes"] == [2, 4, 8, 16, 32, 64, 128, 256]
-    assert captured["batch_size"] == 2
+    decoder = BatchDepthDecoder(model, max_batch_size=128)
+    assert captured == {}
+    assert decoder.graph is None
+    decoder.prepare(3)
+    assert captured["bucket_sizes"] == [8]
+    assert captured["batch_size"] == 8
+    first = decoder.graph
+    decoder.prepare(4)
+    assert decoder.graph is first
+    decoder.prepare(16)
+    assert decoder.graph is not first
+    assert captured["bucket_sizes"] == [32]
+    assert captured["batch_size"] == 32
+    with pytest.raises(ValueError, match="Unsupported batch size"):
+        decoder.prepare(129)
     assert captured["dtype"] == torch.bfloat16
     assert captured["top_p"] == 1.0
     assert captured["top_k"] == 50

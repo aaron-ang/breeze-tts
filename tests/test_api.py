@@ -122,8 +122,12 @@ class FakeBatchModel:
 
 
 class FakeBatchDepthDecoder:
+    def prepare(self, batch_size):
+        self.prepared_sizes.append(batch_size)
+
     def __init__(self) -> None:
         self.bound_models = []
+        self.prepared_sizes = []
         self.active = False
 
     @contextmanager
@@ -512,3 +516,11 @@ def test_model_route_reports_checkpoint_facts(tmp_path, monkeypatch) -> None:
         "max_new_tokens": 1500,
         "max_batch_texts": 128,
     }
+
+
+def test_batch_graph_capture_only_for_cfg(batch_client) -> None:
+    decoder = app.state.batch_depth_decoder
+    _post_batch(batch_client, ["hello"], cfg_scale="1")
+    assert decoder.prepared_sizes == []
+    _post_batch(batch_client, ["one", "two", "three"], cfg_scale="4")
+    assert decoder.prepared_sizes == [3]
