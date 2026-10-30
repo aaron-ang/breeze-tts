@@ -1,4 +1,4 @@
-torch==2.9.1
+torch==2.13.0
 torchaudio==2.9.1
 qwen-tts==0.1.1
 transformers==4.57.3
